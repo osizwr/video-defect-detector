@@ -20,20 +20,58 @@ Open Terminal in this project folder and run:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+## First-time setup (Windows)
+
+Install Python from [python.org](https://www.python.org/downloads/windows/). During installation, select **Add python.exe to PATH**.
+
+Open PowerShell in this project folder and run:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+If PowerShell blocks the activation script, allow locally created scripts for your user account, then activate the environment again:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\.venv\Scripts\Activate.ps1
+```
+
+If you are using Command Prompt instead of PowerShell, use these equivalent commands:
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install -r requirements.txt
 ```
 
 ## Every time you want to scan
 
 1. Put MP4 files in the `mp4` folder (subfolders are also searched).
-2. Open Terminal in the project folder.
-3. Activate the environment if you are using one:
+2. Open Terminal (Mac), PowerShell, or Command Prompt (Windows) in the project folder.
+3. Activate the environment:
 
+   **Mac:**
 ```bash
 source .venv/bin/activate
 ```
 
-4. Run exactly:
+   **Windows PowerShell:**
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+   **Windows Command Prompt:**
+```bat
+.venv\Scripts\activate.bat
+```
+
+4. Run:
 
 ```bash
 python video_defect_detector.py
