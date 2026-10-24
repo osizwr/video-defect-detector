@@ -1,5 +1,7 @@
 # MP4 Video Defect Detector
 
+Automatically scan videos for possible visual and audio-signal defects such as black frames, frozen frames, abnormal borders, abrupt brightness changes, and audio dropouts. The tool generates a CSV report, annotated evidence screenshots, and a contact sheet so suspected issues can be reviewed quickly without modifying the source videos.
+
 ## Simple folder setup
 
 Keep this structure:

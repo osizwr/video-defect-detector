@@ -1,374 +1,153 @@
 #!/usr/bin/env python3
-"""
-MP4 Video Defect Detector
-Scans a folder recursively for MP4 files and flags:
-  - unexpected black bars on left/right or top/bottom
-  - near-completely black frames / black flashes
-  - changes in detected black-border geometry compared with neighboring frames
-
-Outputs:
-  - report.csv
-  - evidence/*.jpg (annotated frames)
-  - contact_sheet.jpg (all incidents, when any are found)
-
-Requires: Python 3.10+, opencv-python, numpy, Pillow
-
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python video_defect_detector.py
-"""
-from __future__ import annotations
-
-import argparse
-import csv
-import math
-import os
-from dataclasses import dataclass
+"""Heuristic MP4 visual and audio-signal defect scanner."""
+import argparse, csv, math, shutil, subprocess, tempfile, wave
+from collections import Counter
 from pathlib import Path
-from typing import Optional
-
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
+FIELDS = ["video","start_timestamp","end_timestamp","start_seconds","end_seconds","issue_type","confidence","details","evidence_screenshot","evidence_audio"]
 
-@dataclass
-class FrameResult:
-    frame_idx: int
-    time_s: float
-    width: int
-    height: int
-    left: int
-    right: int
-    top: int
-    bottom: int
-    black_fraction: float
-    full_black: bool
-    border_detected: bool
-    signature: tuple[int, int, int, int]
+def ts(x):
+    x=max(0.0,float(x)); return f"{int(x//3600):02d}:{int((x%3600)//60):02d}:{x%60:06.3f}"
 
+def mkdir(p): p.mkdir(parents=True,exist_ok=True)
 
-@dataclass
-class Incident:
-    video: Path
-    start_s: float
-    end_s: float
-    kind: str
-    confidence: str
-    details: str
-    evidence: Path
-    frame_idx: int
+def extract_audio(video, wavpath):
+    ffmpeg=shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("[WARN] ffmpeg not found; skipping audio checks. Install with: brew install ffmpeg"); return False
+    r=subprocess.run([ffmpeg,"-hide_banner","-loglevel","error","-y","-i",str(video),"-vn","-ac","1","-ar","16000","-c:a","pcm_s16le",str(wavpath)],capture_output=True,text=True)
+    if r.returncode:
+        print(f"[WARN] Could not extract audio from {video.name}: {r.stderr.strip()[:250]}"); return False
+    return True
 
+def save_clip(samples,sr,start,end,dest):
+    a=max(0,int(start*sr)); b=min(len(samples),int(end*sr))
+    if b<=a:return False
+    pcm=np.clip(samples[a:b]*32768,-32768,32767).astype("<i2")
+    with wave.open(str(dest),"wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm.tobytes())
+    return True
 
-def fmt_time(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}"
-
-
-def frame_metrics(frame: np.ndarray, args) -> dict:
-    """Estimate black edge runs and whole-frame blackness from grayscale pixels."""
-    h, w = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # A pixel counts as near-black only below this threshold. A small tolerance
-    # handles compression noise, but raise it cautiously to avoid dark scenes.
-    black = gray <= args.black_threshold
-    black_fraction = float(np.mean(black))
-    full_black = black_fraction >= args.full_black_fraction
-
-    # Evaluate edge strips, excluding corners so a dark scene doesn't trigger
-    # just because the corner pixels are dark.
-    x0, x1 = int(w * 0.20), int(w * 0.80)
-    y0, y1 = int(h * 0.20), int(h * 0.80)
-    min_run_x = max(2, int(w * args.min_bar_fraction))
-    min_run_y = max(2, int(h * args.min_bar_fraction))
-    edge_black_fraction = args.edge_black_fraction
-
-    def row_is_bar(y: int) -> bool:
-        return float(np.mean(black[y, x0:x1])) >= edge_black_fraction
-
-    def col_is_bar(x: int) -> bool:
-        return float(np.mean(black[y0:y1, x])) >= edge_black_fraction
-
-    top = 0
-    while top < int(h * args.max_bar_fraction) and row_is_bar(top):
-        top += 1
-    bottom = 0
-    while bottom < int(h * args.max_bar_fraction) and row_is_bar(h - 1 - bottom):
-        bottom += 1
-    left = 0
-    while left < int(w * args.max_bar_fraction) and col_is_bar(left):
-        left += 1
-    right = 0
-    while right < int(w * args.max_bar_fraction) and col_is_bar(w - 1 - right):
-        right += 1
-
-    # Reject tiny edge runs and normalize them to zero.
-    if top < min_run_y:
-        top = 0
-    if bottom < min_run_y:
-        bottom = 0
-    if left < min_run_x:
-        left = 0
-    if right < min_run_x:
-        right = 0
-
-    border_detected = any((left, right, top, bottom))
-    return {
-        "left": left, "right": right, "top": top, "bottom": bottom,
-        "black_fraction": black_fraction, "full_black": full_black,
-        "border_detected": border_detected,
-        "signature": (left, right, top, bottom),
-    }
-
-
-def annotate(frame: np.ndarray, metrics: dict, label: str) -> np.ndarray:
-    image = frame.copy()
-    h, w = image.shape[:2]
-    color = (0, 80, 255)
-    thickness = max(2, min(w, h) // 300)
-    left, right, top, bottom = (metrics[k] for k in ("left", "right", "top", "bottom"))
-    if left:
-        cv2.rectangle(image, (0, 0), (left, h - 1), color, thickness)
-    if right:
-        cv2.rectangle(image, (w - right, 0), (w - 1, h - 1), color, thickness)
-    if top:
-        cv2.rectangle(image, (0, 0), (w - 1, top), color, thickness)
-    if bottom:
-        cv2.rectangle(image, (0, h - bottom), (w - 1, h - 1), color, thickness)
-    overlay_h = min(72, max(40, h // 10))
-    cv2.rectangle(image, (0, 0), (w, overlay_h), (20, 20, 20), -1)
-    cv2.putText(image, label[:150], (12, min(28, overlay_h - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, max(0.45, min(0.8, w / 1400)),
-                (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(image, f"black={metrics['black_fraction']:.1%} bars L/R/T/B="
-                f"{left}/{right}/{top}/{bottom}",
-                (12, min(overlay_h - 8, 52)), cv2.FONT_HERSHEY_SIMPLEX,
-                max(0.4, min(0.65, w / 1600)), (0, 220, 255), 1, cv2.LINE_AA)
-    return image
-
-
-def sample_video(video: Path, args, evidence_dir: Path) -> list[Incident]:
-    cap = cv2.VideoCapture(str(video))
-    if not cap.isOpened():
-        print(f"[WARN] Could not open: {video}")
-        return []
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or not math.isfinite(fps) or fps <= 0:
-        fps = 25.0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = frame_count / fps if frame_count > 0 else 0.0
-    step = max(1, int(round(fps / args.sample_fps)))
-    results: list[FrameResult] = []
-    frame_idx = 0
-    print(f"[SCAN] {video} ({duration:.1f}s, {fps:.2f} fps; sample every {step} frame(s))")
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if frame_idx % step == 0:
-            t = frame_idx / fps
-            m = frame_metrics(frame, args)
-            h, w = frame.shape[:2]
-            results.append(FrameResult(
-                frame_idx, t, w, h, m["left"], m["right"], m["top"], m["bottom"],
-                m["black_fraction"], m["full_black"], m["border_detected"], m["signature"]
-            ))
-        frame_idx += 1
-    cap.release()
-
-    if not results:
-        return []
-
-    # Establish a baseline border signature from the most common sampled geometry.
-    # This helps distinguish persistent/intentional letterboxing from bars that appear
-    # only in a portion of the video.
-    from collections import Counter
-    sig_counts = Counter(r.signature for r in results if not r.full_black)
-    baseline = sig_counts.most_common(1)[0][0] if sig_counts else (0, 0, 0, 0)
-
-    flags: list[tuple[FrameResult, str, str, str]] = []
-    for i, r in enumerate(results):
-        prev_r = results[i - 1] if i > 0 else None
-        next_r = results[i + 1] if i + 1 < len(results) else None
-
-        if r.full_black:
-            # Only flag black flashes, not an all-black video or long black intro/outro.
-            neighbors_nonblack = sum(
-                n is not None and not n.full_black
-                for n in (prev_r, next_r)
-            )
-            if neighbors_nonblack:
-                flags.append((r, "Black frame / flash", "Medium",
-                              f"{r.black_fraction:.1%} of pixels are near-black; inspect for intentional transition"))
-            continue
-
-        # A border is suspicious when its geometry differs from the common baseline,
-        # especially if it appears only in one/few sampled frames.
-        sig = r.signature
-        if sig != baseline and r.border_detected:
-            # Avoid flagging normal bars present throughout the video.
-            neighboring_baseline = any(
-                n is not None and n.signature == baseline
-                for n in (prev_r, next_r)
-            )
-            duration_hint = "border geometry differs from video baseline"
-            if neighboring_baseline:
-                flags.append((r, "Unexpected black bars", "High", duration_hint))
-            else:
-                flags.append((r, "Black bars (review)", "Low", duration_hint))
-        # A strong geometry jump from adjacent frames can indicate a clip aspect change.
-        if prev_r is not None and sig != prev_r.signature:
-            delta = sum(abs(a - b) for a, b in zip(sig, prev_r.signature))
-            threshold = max(8, int(min(r.width, r.height) * args.geometry_change_fraction))
-            if delta >= threshold and (r.border_detected or prev_r.border_detected):
-                flags.append((r, "Border/aspect change", "Medium",
-                              f"border measurement changed by {delta}px from previous sample"))
-
-    if not flags:
-        return []
-
-    # Merge flags of same kind that occur within the configured gap.
-    flags.sort(key=lambda item: item[0].time_s)
-    groups: list[list[tuple[FrameResult, str, str, str]]] = []
-    for flag in flags:
-        r, kind, confidence, details = flag
-        if groups and groups[-1][-1][1] == kind and (
-            r.time_s - groups[-1][-1][0].time_s <= args.merge_gap
-        ):
-            groups[-1].append(flag)
-        else:
-            groups.append([flag])
-
-    incidents: list[Incident] = []
-    safe_stem = "".join(c if c.isalnum() or c in "-_." else "_" for c in video.stem)
-    for number, group in enumerate(groups, 1):
-        first = group[0][0]
-        last = group[-1][0]
-        kinds = list(dict.fromkeys(x[1] for x in group))
-        kind = kinds[0] if len(kinds) == 1 else " / ".join(kinds)
-        confidence_order = {"High": 3, "Medium": 2, "Low": 1}
-        confidence = max((x[2] for x in group), key=lambda c: confidence_order[c])
-        details = "; ".join(dict.fromkeys(x[3] for x in group))
-        evidence_path = evidence_dir / f"{safe_stem}_{number:04d}_{first.time_s:.3f}s.jpg"
-        # Re-read exact first flagged frame for high-quality evidence.
-        cap = cv2.VideoCapture(str(video))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, first.frame_idx)
-        ok, frame = cap.read()
-        cap.release()
-        if ok:
-            m = {
-                "left": first.left, "right": first.right, "top": first.top, "bottom": first.bottom,
-                "black_fraction": first.black_fraction
-            }
-            label = f"{video.name} | {fmt_time(first.time_s)} | {kind}"
-            cv2.imwrite(str(evidence_path), annotate(frame, m, label), [cv2.IMWRITE_JPEG_QUALITY, 92])
-        else:
-            evidence_path = Path("")
-        incidents.append(Incident(video, first.time_s, last.time_s, kind, confidence,
-                                  details, evidence_path, first.frame_idx))
-    return incidents
-
-
-def make_contact_sheet(incidents: list[Incident], output: Path, thumb_w: int = 360,
-                       thumb_h: int = 220, columns: int = 3) -> None:
-    valid = [i for i in incidents if i.evidence and i.evidence.exists()]
-    if not valid:
-        return
-    rows = math.ceil(len(valid) / columns)
-    label_h = 48
-    sheet = Image.new("RGB", (columns * thumb_w, rows * (thumb_h + label_h)), "white")
-    draw = ImageDraw.Draw(sheet)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 13)
-    except OSError:
-        font = ImageFont.load_default()
-    for idx, incident in enumerate(valid):
-        x = (idx % columns) * thumb_w
-        y = (idx // columns) * (thumb_h + label_h)
-        with Image.open(incident.evidence) as im:
-            im = im.convert("RGB")
-            im.thumbnail((thumb_w, thumb_h))
-            sheet.paste(im, (x, y))
-        label = f"{incident.video.name[:42]}\n{fmt_time(incident.start_s)}–{fmt_time(incident.end_s)} | {incident.kind}"
-        draw.text((x + 5, y + thumb_h + 4), label, fill="black", font=font)
-    sheet.save(output, quality=90)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Detect possible black bars and black flashes in MP4 videos.")
-    parser.add_argument("input_folder", nargs="?", default="mp4", help="Folder containing MP4 files (default: ./mp4)")
-    parser.add_argument("-o", "--output", default="output", help="Output directory (default: ./output)")
-    parser.add_argument("--sample-fps", type=float, default=2.0, help="Frames inspected per second (default: 2; use 5-10 for short defects)")
-    parser.add_argument("--black-threshold", type=int, default=18, help="Grayscale value 0-255 considered near-black (default: 18)")
-    parser.add_argument("--edge-black-fraction", type=float, default=0.96, help="Fraction of edge strip pixels that must be black (default: 0.96)")
-    parser.add_argument("--full-black-fraction", type=float, default=0.985, help="Whole-frame near-black fraction to count as black (default: 0.985)")
-    parser.add_argument("--min-bar-fraction", type=float, default=0.012, help="Minimum bar width/height as fraction of frame (default: 0.012)")
-    parser.add_argument("--max-bar-fraction", type=float, default=0.30, help="Maximum edge bar search depth as fraction of frame (default: 0.30)")
-    parser.add_argument("--geometry-change-fraction", type=float, default=0.015, help="Border geometry change threshold relative to shorter dimension")
-    parser.add_argument("--merge-gap", type=float, default=2.0, help="Merge same-kind detections within this many seconds (default: 2)")
-    parser.add_argument("--include-hidden", action="store_true", help="Include hidden folders/files")
-    args = parser.parse_args()
-
-    if not 0 <= args.black_threshold <= 255:
-        parser.error("--black-threshold must be between 0 and 255")
-    if args.sample_fps <= 0:
-        parser.error("--sample-fps must be greater than 0")
-    root = Path(args.input_folder).expanduser().resolve()
-    if not root.is_dir():
-        parser.error(f"Input folder does not exist or is not a directory: {root}")
-    output = Path(args.output).expanduser().resolve()
-    evidence_dir = output / "evidence"
-    output.mkdir(parents=True, exist_ok=True)
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-
-    videos = [
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() == ".mp4"
-        and (args.include_hidden or not any(part.startswith(".") for part in p.relative_to(root).parts))
-    ]
-    videos.sort()
-    if not videos:
-        print(f"No MP4 files found under {root}")
-        return 0
-
-    incidents: list[Incident] = []
-    for video in videos:
+def audio_scan(video,evidence):
+    with tempfile.TemporaryDirectory(prefix="defect_audio_") as td:
+        wavpath=Path(td)/"audio.wav"
+        if not extract_audio(video,wavpath): return []
         try:
-            incidents.extend(sample_video(video, args, evidence_dir))
-        except Exception as exc:
-            print(f"[ERROR] {video}: {exc}")
+            with wave.open(str(wavpath),"rb") as w:
+                sr=w.getframerate(); channels=w.getnchannels(); width=w.getsampwidth(); raw=w.readframes(w.getnframes())
+            if width!=2 or not raw:return []
+            samples=np.frombuffer(raw,dtype="<i2").astype(np.float32)/32768
+            if channels>1:samples=samples.reshape(-1,channels).mean(axis=1)
+        except Exception as e:
+            print(f"[WARN] Could not read audio for {video.name}: {e}"); return []
+        dur=len(samples)/sr; win=max(1,int(sr*.02)); n=len(samples)//win
+        if n<2:return []
+        blocks=samples[:n*win].reshape(n,win)
+        rms=np.sqrt(np.mean(blocks**2,axis=1)+1e-12); peak=np.max(np.abs(blocks),axis=1)
+        rmsdb=20*np.log10(np.maximum(rms,1e-8)); peakdb=20*np.log10(np.maximum(peak,1e-8))
+        rows=[]
+        def add(kind,start,end,conf,details):
+            end=min(dur,max(start+.02,end)); start=max(0,start)
+            clip=evidence/f"{video.stem}_audio_{kind}_{start:.2f}s.wav".replace(" ","_")
+            save_clip(samples,sr,max(0,start-.35),min(dur,end+.35),clip)
+            rows.append(dict(video=str(video),start_timestamp=ts(start),end_timestamp=ts(end),start_seconds=round(start,3),end_seconds=round(end,3),issue_type=kind,confidence=conf,details=details,evidence_screenshot="",evidence_audio=str(clip) if clip.exists() else ""))
+        # Short high peaks compared with local RMS may be clicks/pops (false positives possible).
+        transient=(peakdb>-8)&((peakdb-rmsdb)>17)
+        groups=[]
+        for ix in np.flatnonzero(transient):
+            ix=int(ix)
+            if not groups or ix-groups[-1][-1]>3:groups.append([ix])
+            else:groups[-1].append(ix)
+        for g in groups:
+            i=g[len(g)//2]; add("audio_click_or_pop",i*.02,i*.02+.04,"low","Short high-peak transient; could be a click/pop or a harmless sharp sound.")
+        # Sustained near-full-scale peaks.
+        clipped=peak>=.999; i=0
+        while i<len(clipped):
+            if not clipped[i]:i+=1;continue
+            j=i+1
+            while j<len(clipped) and clipped[j]:j+=1
+            if j-i>=3:add("audio_clipping",i*.02,j*.02,"medium",f"Near-full-scale peaks persisted for {(j-i)*.02:.2f}s; possible clipping/distortion.")
+            i=j
+        # Detect one clear abrupt volume jump.
+        for i in range(5,len(rmsdb)-5):
+            before=float(np.median(rmsdb[i-5:i])); after=float(np.median(rmsdb[i:i+5]))
+            if before>-42 and after>-42 and abs(after-before)>=24:
+                add("audio_abrupt_level_change",i*.02,(i+5)*.02,"low",f"Audio level changed abruptly by about {abs(after-before):.0f} dB across adjacent 100 ms windows."); break
+        return rows
 
-    report = output / "report.csv"
-    with report.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["video", "start_timestamp", "end_timestamp", "start_seconds", "end_seconds",
-                         "issue_type", "confidence", "details", "evidence_screenshot"])
-        for i in incidents:
-            writer.writerow([
-                str(i.video), fmt_time(i.start_s), fmt_time(i.end_s),
-                f"{i.start_s:.3f}", f"{i.end_s:.3f}", i.kind, i.confidence,
-                i.details, str(i.evidence) if i.evidence else ""
-            ])
+def video_scan(video,evidence,sample_fps):
+    cap=cv2.VideoCapture(str(video))
+    if not cap.isOpened():print(f"[WARN] Cannot open video: {video}");return []
+    fps=cap.get(cv2.CAP_PROP_FPS) or 30.; total=cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    dur=total/fps if fps else 0; step=max(1,int(round(fps/max(sample_fps,.1))))
+    print(f"[SCAN] {video} ({dur:.1f}s, {fps:.2f} fps; sample every {step} frame(s))")
+    rows=[]; geometries=[]; idx=0
+    while True:
+        ok,frame=cap.read()
+        if not ok:break
+        if idx%step==0:
+            h,w=frame.shape[:2]; gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+            mean=float(gray.mean()); darkfrac=float(np.mean(gray<12)); sec=idx/fps
+            if mean<3 or darkfrac>.985:
+                shot=evidence/f"{video.stem}_black_frame_{sec:.2f}s.jpg";cv2.imwrite(str(shot),frame)
+                rows.append(dict(video=str(video),start_timestamp=ts(sec),end_timestamp=ts(sec+1/max(sample_fps,1)),start_seconds=round(sec,3),end_seconds=round(sec+1/max(sample_fps,1),3),issue_type="black_or_near_black_frame",confidence="medium",details=f"Frame brightness mean={mean:.2f}; dark pixels={darkfrac:.1%}.",evidence_screenshot=str(shot),evidence_audio=""))
+            dark=gray<18; rd=dark.mean(axis=1); cd=dark.mean(axis=0)
+            top=0
+            while top<h//4 and rd[top]>.985:top+=1
+            bot=h-1
+            while bot>3*h//4 and rd[bot]>.985:bot-=1
+            left=0
+            while left<w//4 and cd[left]>.985:left+=1
+            right=w-1
+            while right>3*w//4 and cd[right]>.985:right-=1
+            geometries.append(((left,top,right,bot),sec,frame.copy()))
+        idx+=1
+    cap.release()
+    if len(geometries)>=5:
+        common=Counter(x[0] for x in geometries).most_common(1)[0][0]
+        for g,sec,frame in geometries:
+            if max(abs(g[i]-common[i]) for i in range(4))>12:
+                shot=evidence/f"{video.stem}_border_change_{sec:.2f}s.jpg";cv2.imwrite(str(shot),frame)
+                rows.append(dict(video=str(video),start_timestamp=ts(sec),end_timestamp=ts(sec+1/max(sample_fps,1)),start_seconds=round(sec,3),end_seconds=round(sec+1/max(sample_fps,1),3),issue_type="possible_border_or_crop_change",confidence="low",details=f"Detected dark-border geometry {g}; common geometry {common}. Verify manually.",evidence_screenshot=str(shot),evidence_audio=""))
+    return rows
 
-    sheet = output / "contact_sheet.jpg"
-    make_contact_sheet(incidents, sheet)
-    print("\n=== Scan complete ===")
-    print(f"Videos scanned: {len(videos)}")
-    print(f"Incidents flagged: {len(incidents)}")
-    print(f"CSV report: {report}")
-    print(f"Evidence screenshots: {evidence_dir}")
-    print(f"Contact sheet: {sheet if sheet.exists() else 'not created (no evidence screenshots)'}")
-    print("\nReview flagged items manually; these are potential defects, not guaranteed errors.")
+def make_contact_sheet(rows,out):
+    imgs=[r for r in rows if r.get("evidence_screenshot") and Path(r["evidence_screenshot"]).exists()]
+    if not imgs:return
+    tiles=[]
+    for r in imgs[:60]:
+        im=Image.open(r["evidence_screenshot"]).convert("RGB"); im.thumbnail((320,180))
+        tile=Image.new("RGB",(340,220),"white");tile.paste(im,((340-im.width)//2,6))
+        ImageDraw.Draw(tile).text((8,190),f'{r["issue_type"]} @ {r["start_timestamp"]}',fill="black");tiles.append(tile)
+    cols=3; sheet=Image.new("RGB",(cols*340,math.ceil(len(tiles)/cols)*220),"#ddd")
+    for i,im in enumerate(tiles):sheet.paste(im,((i%cols)*340,(i//cols)*220))
+    sheet.save(out/"contact_sheet.jpg",quality=90)
+
+def main():
+    p=argparse.ArgumentParser(description="Detect possible visual and audio-signal defects in videos.")
+    p.add_argument("input",nargs="?",default="mp4",help="Input folder (default ./mp4)")
+    p.add_argument("-o","--output",default="output",help="Output folder (default ./output)")
+    p.add_argument("--sample-fps",type=float,default=2.,help="Video sampling rate, default 2 frames/sec")
+    p.add_argument("--no-audio",action="store_true",help="Disable audio signal checks")
+    a=p.parse_args(); inp=Path(a.input).expanduser().resolve();out=Path(a.output).expanduser().resolve()
+    if not inp.is_dir():print(f"[ERROR] Input folder not found: {inp}");return 2
+    videos=sorted(x for x in inp.iterdir() if x.is_file() and x.suffix.lower() in {".mp4",".m4v",".mov"})
+    if not videos:print(f"[ERROR] No MP4/M4V/MOV videos found in {inp}");return 2
+    mkdir(out); evidence=out/"evidence";mkdir(evidence);allrows=[]
+    for video in videos:
+        allrows.extend(video_scan(video,evidence,a.sample_fps))
+        if not a.no_audio:
+            print(f"[AUDIO] Checking audio signal: {video.name}")
+            allrows.extend(audio_scan(video,evidence))
+    with (out/"report.csv").open("w",newline="",encoding="utf-8-sig") as f:
+        w=csv.DictWriter(f,fieldnames=FIELDS,extrasaction="ignore");w.writeheader();w.writerows(allrows)
+    make_contact_sheet(allrows,out)
+    print(f"\\n[DONE] Scanned {len(videos)} video(s). Found {len(allrows)} possible issue(s).")
+    print(f"[REPORT] {out/'report.csv'}");print(f"[EVIDENCE] {evidence}")
+    print("Audio checks are heuristic and can produce false positives; listen to clips to confirm.")
     return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__":raise SystemExit(main())
